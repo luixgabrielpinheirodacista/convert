@@ -1,0 +1,511 @@
+-- Carrega pelo GitHub Raw para evitar bloqueio de Cloudflare no Delta
+local success, Rayfield = pcall(function()
+   return loadstring(game:HttpGet('https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua'))()
+end)
+
+if not success or not Rayfield then
+   game:GetService("StarterGui"):SetCore("SendNotification", {
+      Title = "Zen Eclipse - Erro",
+      Text = "Falha ao carregar a interface. Verifique a internet.",
+      Duration = 10
+   })
+   warn("Erro ao carregar Rayfield: ", Rayfield)
+   return
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+local Window = Rayfield:CreateWindow({
+   Name = "Zen Eclipse NPC Panel",
+   LoadingTitle = "Zen Eclipse",
+   LoadingSubtitle = "Carregando...",
+   ConfigurationSaving = { Enabled = false },
+   KeySystem = false
+})
+
+local NpcTab = Window:CreateTab("Main", 4483362458)
+local SettingsTab = Window:CreateTab("Settings", 4483362459)
+local MiscTab = Window:CreateTab("Misc", 4483362460)
+
+local npcDropdown, npcMap = nil, {}
+local selectedLabel, controlMode, npcSpeed = nil, "Dentro", 16
+local controlConn, viewConn, autoMoveConn, followConn, spinConn, shiftlockConn = nil, nil, nil, nil, nil, nil
+local controlToggleRef, followToggleRef, freezeToggleRef, sitToggleRef, spinToggleRef, viewToggleRef, wanderToggleRef = nil, nil, nil, nil, nil, nil, nil
+
+local flyEnabled, flySpeed, flyConn, currentVelocity = false, 50, nil, Vector3.new(0, 0, 0)
+local keys = {W = false, S = false, A = false, D = false, Space = false, Shift = false}
+
+-- Esconde apenas a cabeça e acessórios para não vazar para fora do NPC
+local function setHeadInvisible(char, invisible)
+   pcall(function()
+       local head = char:FindFirstChild("Head")
+       if head then
+           head.Transparency = invisible and 1 or 0
+           for _, child in ipairs(head:GetChildren()) do
+               if child:IsA("Decal") then child.Transparency = invisible and 1 or 0 end
+           end
+       end
+       for _, desc in ipairs(char:GetDescendants()) do
+           if desc:IsA("Accessory") then
+               local handle = desc:FindFirstChild("Handle")
+               if handle then handle.Transparency = invisible and 1 or 0 end
+           end
+       end
+   end)
+end
+
+local function getActiveNPCs()
+   local options, count = {}, {}
+   pcall(function()
+      for _, obj in ipairs(workspace:GetDescendants()) do
+         if obj:IsA("Model") then
+            local hum = obj:FindFirstChildOfClass("Humanoid")
+            local hrp = obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart
+            if hum and hrp and hum.Health > 0 and Players:GetPlayerFromCharacter(obj) == nil then
+               count[obj.Name] = (count[obj.Name] or 0) + 1
+               local label = obj.Name .. " [#" .. count[obj.Name] .. "]"
+               npcMap[label] = obj
+               table.insert(options, label)
+            end
+         end
+      end
+   end)
+   if #options == 0 then table.insert(options, "Nenhum NPC encontrado") end
+   return options
+end
+
+local function getValidTarget()
+   local target = selectedLabel and npcMap[selectedLabel]
+   if not target or not target.Parent then return nil end
+   local hum = target:FindFirstChildOfClass("Humanoid")
+   local hrp = target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart
+   if hum and hrp and hum.Health > 0 then return target, hrp, hum end
+   return nil
+end
+
+-- ==================== MAIN TAB ====================
+npcDropdown = NpcTab:CreateDropdown({
+   Name = "Selecionar NPC",
+   Options = getActiveNPCs(),
+   CurrentOption = "",
+   Flag = "NpcDropdown",
+   Callback = function(Option)
+      selectedLabel = type(Option) == "table" and Option[1] or Option
+   end,
+})
+
+NpcTab:CreateButton({
+   Name = "Atualizar Lista de NPCs",
+   Callback = function() npcDropdown:Refresh(getActiveNPCs()) end,
+})
+
+NpcTab:CreateButton({
+   Name = "Teleportar para o NPC",
+   Callback = function()
+      local char = LocalPlayer.Character
+      local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+      local _, targetHRP = getValidTarget()
+      if myHRP and targetHRP then
+         myHRP.CFrame = targetHRP.CFrame + Vector3.new(0, 3, 0)
+         Rayfield:Notify({Title = "Zen Eclipse", Content = "Teleportado!", Duration = 2})
+      end
+   end,
+})
+
+NpcTab:CreateButton({
+   Name = "Puxar NPC (Bring NPC)",
+   Callback = function()
+      local char = LocalPlayer.Character
+      local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+      local target, targetHRP = getValidTarget()
+      if myHRP and targetHRP then
+         pcall(function()
+            targetHRP.Anchored = false
+            for _, part in ipairs(target:GetDescendants()) do
+               if part:IsA("BasePart") then part:SetNetworkOwner(LocalPlayer) end
+            end
+         end)
+         targetHRP.CFrame = myHRP.CFrame + (myHRP.CFrame.LookVector * 4) + Vector3.new(0, 2, 0)
+         Rayfield:Notify({Title = "Zen Eclipse", Content = "NPC puxado para você!", Duration = 2})
+      else
+         Rayfield:Notify({Title = "Zen Eclipse", Content = "Selecione um NPC válido!", Duration = 2})
+      end
+   end,
+})
+
+spinToggleRef = NpcTab:CreateToggle({
+   Name = "Fazer NPC Girar",
+   CurrentValue = false,
+   Flag = "SpinToggle",
+   Callback = function(Value)
+      if Value then
+         local _, targetHRP = getValidTarget()
+         if not targetHRP then return end
+         spinConn = RunService.Heartbeat:Connect(function()
+            if not targetHRP or not targetHRP.Parent then if spinConn then spinConn:Disconnect() end return end
+            targetHRP.CFrame = targetHRP.CFrame * CFrame.Angles(0, math.rad(5), 0)
+         end)
+      else
+         if spinConn then spinConn:Disconnect(); spinConn = nil end
+      end
+   end,
+})
+
+freezeToggleRef = NpcTab:CreateToggle({
+   Name = "Freeze NPC",
+   CurrentValue = false,
+   Flag = "FreezeToggle",
+   Callback = function(Value)
+      local _, targetHRP, targetHum = getValidTarget()
+      if not targetHRP or not targetHum then return end
+      pcall(function()
+         if Value then
+            targetHum.WalkSpeed, targetHum.JumpPower = 0, 0
+            targetHRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            targetHRP.Anchored = true
+         else
+            targetHRP.Anchored = false
+            targetHum.WalkSpeed, targetHum.JumpPower = npcSpeed, 50
+         end
+      end)
+   end,
+})
+
+sitToggleRef = NpcTab:CreateToggle({
+   Name = "Sit NPC",
+   CurrentValue = false,
+   Flag = "SitToggle",
+   Callback = function(Value)
+      local _, _, targetHum = getValidTarget()
+      if targetHum then targetHum.Sit = Value end
+   end,
+})
+
+followToggleRef = NpcTab:CreateToggle({
+   Name = "Follow NPC",
+   CurrentValue = false,
+   Flag = "FollowToggle",
+   Callback = function(Value)
+      if Value then
+         local target, targetHRP, targetHum = getValidTarget()
+         local char = LocalPlayer.Character
+         local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+         if not targetHRP or not myHRP or not targetHum then return end
+         pcall(function()
+            targetHRP.Anchored = false
+            for _, part in ipairs(target:GetDescendants()) do if part:IsA("BasePart") then part:SetNetworkOwner(LocalPlayer) end end
+         end)
+         followConn = RunService.Heartbeat:Connect(function()
+            local currTarget, currHRP, currHum = getValidTarget()
+            local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if not currTarget or not currHRP or not currHum or not myRoot then if followConn then followConn:Disconnect() end return end
+            currHum.WalkSpeed = npcSpeed
+            currHum:MoveTo(myRoot.Position)
+         end)
+      else
+         if followConn then followConn:Disconnect(); followConn = nil end
+      end
+   end,
+})
+
+NpcTab:CreateButton({
+   Name = "Matar NPC Selecionado",
+   Callback = function()
+      local _, _, targetHum = getValidTarget()
+      if targetHum then targetHum.Health = 0; npcDropdown:Refresh(getActiveNPCs()) end
+   end,
+})
+
+NpcTab:CreateButton({
+   Name = "Recuperar Vida (Max Health)",
+   Callback = function()
+      local _, _, targetHum = getValidTarget()
+      if targetHum then targetHum.Health = targetHum.MaxHealth end
+   end,
+})
+
+viewToggleRef = NpcTab:CreateToggle({
+   Name = "View NPC",
+   CurrentValue = false,
+   Flag = "ViewToggle",
+   Callback = function(Value)
+      local cam = workspace.CurrentCamera
+      if Value then
+         local target, _, targetHum = getValidTarget()
+         if not targetHum then return end
+         cam.CameraSubject = targetHum
+         viewConn = RunService.Heartbeat:Connect(function()
+            if not target.Parent or targetHum.Health <= 0 then
+               if viewConn then viewConn:Disconnect() end
+               local myHum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+               if myHum then cam.CameraSubject = myHum end
+            end
+         end)
+      else
+         if viewConn then viewConn:Disconnect(); viewConn = nil end
+         local myHum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+         if myHum then cam.CameraSubject = myHum end
+      end
+   end,
+})
+
+NpcTab:CreateToggle({
+   Name = "Modo Embaixo do NPC",
+   CurrentValue = false,
+   Flag = "ControlModeToggle",
+   Callback = function(Value) controlMode = Value and "Embaixo" or "Dentro" end,
+})
+
+controlToggleRef = NpcTab:CreateToggle({
+   Name = "Controlar NPC (Mover + Pular)",
+   CurrentValue = false,
+   Flag = "WeldToggle",
+   Callback = function(Value)
+      local char = LocalPlayer.Character
+      local myHum = char and char:FindFirstChildOfClass("Humanoid")
+      local cam = workspace.CurrentCamera
+
+      if Value then
+         local target, targetHRP, targetHum = getValidTarget()
+         local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+         if not targetHRP or not myHRP or not myHum then return end
+
+         cam.CameraSubject = targetHum
+         local oldWalkSpeed = myHum.WalkSpeed
+         myHum.WalkSpeed = 0
+         setHeadInvisible(char, true)
+
+         if autoMoveConn then pcall(function() task.cancel(autoMoveConn) end); autoMoveConn = nil end
+
+         pcall(function()
+            targetHRP.Anchored = false
+            for _, part in ipairs(target:GetDescendants()) do if part:IsA("BasePart") then part:SetNetworkOwner(LocalPlayer) end end
+         end)
+
+         controlConn = RunService.Heartbeat:Connect(function()
+            if not target.Parent or targetHum.Health <= 0 or not myHRP.Parent then
+               if controlConn then controlConn:Disconnect() end
+               myHum.WalkSpeed = oldWalkSpeed
+               cam.CameraSubject = myHum
+               setHeadInvisible(char, false)
+               return
+            end
+
+            targetHum.WalkSpeed = npcSpeed
+            pcall(function()
+               for _, part in ipairs(char:GetDescendants()) do if part:IsA("BasePart") then part.CanCollide = false end end
+               for _, part in ipairs(target:GetDescendants()) do if part:IsA("BasePart") then part.CanCollide = false end end
+            end)
+
+            targetHum:Move(myHum.MoveDirection, false)
+            if myHum.Jump then targetHum.Jump = true end
+
+            myHRP.CFrame = controlMode == "Dentro" and targetHRP.CFrame or (targetHRP.CFrame * CFrame.new(0, -6.5, 0))
+            myHRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            myHRP.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+         end)
+      else
+         if controlConn then controlConn:Disconnect(); controlConn = nil end
+
+         pcall(function()
+            local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+            local myHum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            local cam = workspace.CurrentCamera
+            local target, _, targetHum = getValidTarget()
+            local npcVivo = target and targetHum and targetHum.Health > 0
+
+            if myHRP then
+               myHRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+               myHRP.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+               if npcVivo then myHRP.CFrame = myHRP.CFrame + Vector3.new(0, 5, 0) end
+            end
+
+            if myHum then myHum.WalkSpeed = 16; cam.CameraSubject = myHum end
+
+            task.delay(0.15, function()
+               if char then
+                  setHeadInvisible(char, false)
+                  for _, part in ipairs(char:GetDescendants()) do
+                     if part:IsA("BasePart") then
+                        if part.Name == "HumanoidRootPart" or part.Name == "Torso" or part.Name == "UpperTorso" or part.Name == "LowerTorso" then
+                           part.CanCollide = true
+                        else
+                           part.CanCollide = false
+                        end
+                     end
+                     if part:IsA("SelectionBox") or part:IsA("SelectionSphere") or part:IsA("Highlight") then part:Destroy() end
+                  end
+               end
+            end)
+         end)
+         Rayfield:Notify({Title = "Zen Eclipse", Content = "Controle liberado com segurança.", Duration = 2})
+      end
+   end,
+})
+
+wanderToggleRef = NpcTab:CreateToggle({
+   Name = "Andar Sozinho (Idle)",
+   CurrentValue = false,
+   Flag = "IdleWanderToggle",
+   Callback = function(Value)
+      if Value then
+         local target, targetHRP, targetHum = getValidTarget()
+         if not targetHRP then return end
+         autoMoveConn = task.spawn(function()
+            while task.wait(3) do
+               if not target.Parent or targetHum.Health <= 0 then break end
+               local randomOffset = Vector3.new(math.random(-15, 15), 0, math.random(-15, 15))
+               targetHum:MoveTo(targetHRP.Position + randomOffset)
+            end
+         end)
+      else
+         if autoMoveConn then pcall(function() task.cancel(autoMoveConn) end); autoMoveConn = nil end
+      end
+   end,
+})
+
+-- ==================== SETTINGS TAB ====================
+SettingsTab:CreateSlider({
+   Name = "Velocidade do NPC",
+   Range = {16, 100},
+   Increment = 1,
+   CurrentValue = 16,
+   Flag = "NpcSpeedSlider",
+   Callback = function(Value) npcSpeed = Value end,
+})
+
+-- ==================== MISC TAB (FLY & SHIFTLOCK) ====================
+pcall(function()
+   UserInputService.InputBegan:Connect(function(input, gp)
+      if gp then return end
+      if input.KeyCode == Enum.KeyCode.W then keys.W = true end
+      if input.KeyCode == Enum.KeyCode.S then keys.S = true end
+      if input.KeyCode == Enum.KeyCode.A then keys.A = true end
+      if input.KeyCode == Enum.KeyCode.D then keys.D = true end
+      if input.KeyCode == Enum.KeyCode.Space then keys.Space = true end
+      if input.KeyCode == Enum.KeyCode.LeftShift then keys.Shift = true end
+   end)
+   UserInputService.InputEnded:Connect(function(input)
+      if input.KeyCode == Enum.KeyCode.W then keys.W = false end
+      if input.KeyCode == Enum.KeyCode.S then keys.S = false end
+      if input.KeyCode == Enum.KeyCode.A then keys.A = false end
+      if input.KeyCode == Enum.KeyCode.D then keys.D = false end
+      if input.KeyCode == Enum.KeyCode.Space then keys.Space = false end
+      if input.KeyCode == Enum.KeyCode.LeftShift then keys.Shift = false end
+   end)
+end)
+
+MiscTab:CreateSlider({
+   Name = "Velocidade do Fly",
+   Range = {20, 200},
+   Increment = 5,
+   CurrentValue = 50,
+   Flag = "FlySpeedSlider",
+   Callback = function(Value) flySpeed = Value end,
+})
+
+MiscTab:CreateToggle({
+   Name = "Fly Fluido",
+   CurrentValue = false,
+   Flag = "FlyToggle",
+   Callback = function(Value)
+      flyEnabled = Value
+      local cam = workspace.CurrentCamera
+      if flyEnabled then
+         currentVelocity = Vector3.new(0, 0, 0)
+         flyConn = RunService.RenderStepped:Connect(function(dt)
+            local _, targetHRP = getValidTarget()
+            local activePart = (controlConn and targetHRP) or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart"))
+            if activePart then
+               local targetDir = Vector3.new(0,0,0)
+               local cf = cam.CFrame
+               if keys.W then targetDir = targetDir + cf.LookVector end
+               if keys.S then targetDir = targetDir - cf.LookVector end
+               if keys.A then targetDir = targetDir - cf.RightVector end
+               if keys.D then targetDir = targetDir + cf.RightVector end
+               if keys.Space then targetDir = targetDir + Vector3.new(0, 1, 0) end
+               if keys.Shift then targetDir = targetDir - Vector3.new(0, 1, 0) end
+
+               local desiredVelocity = targetDir.Magnitude > 0 and (targetDir.Unit * flySpeed) or Vector3.new(0, 0, 0)
+               currentVelocity = currentVelocity:Lerp(desiredVelocity, math.clamp(dt * 12, 0, 1))
+               activePart.AssemblyLinearVelocity = currentVelocity
+            end
+         end)
+      else
+         if flyConn then flyConn:Disconnect(); flyConn = nil end
+         currentVelocity = Vector3.new(0, 0, 0)
+      end
+   end,
+})
+
+MiscTab:CreateToggle({
+   Name = "Shiftlock (Estilo Roblox)",
+   CurrentValue = false,
+   Flag = "ShiftlockToggle",
+   Callback = function(Value)
+      local cam = workspace.CurrentCamera
+      if Value then
+         shiftlockConn = RunService.RenderStepped:Connect(function()
+            local _, targetHRP = getValidTarget()
+            local targetPart = (controlConn and targetHRP) or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart"))
+            local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            
+            if targetPart and hum then
+               hum.AutoRotate = false
+               local camLook = cam.CFrame.LookVector
+               local flatLook = Vector3.new(camLook.X, 0, camLook.Z)
+               if flatLook.Magnitude > 0 then
+                  targetPart.CFrame = CFrame.new(targetPart.Position, targetPart.Position + flatLook)
+               end
+            end
+         end)
+      else
+         if shiftlockConn then shiftlockConn:Disconnect(); shiftlockConn = nil end
+         local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+         if hum then
+            hum.AutoRotate = true
+         end
+      end
+   end,
+})
+
+-- ==================== MONITOR & RESET ====================
+task.spawn(function()
+   while task.wait(1) do
+      local char = LocalPlayer.Character
+      local hum = char and char:FindFirstChildOfClass("Humanoid")
+      if (hum and hum.Health <= 0) or (selectedLabel and selectedLabel ~= "") then
+         local target, _, targetHum = getValidTarget()
+         if (hum and hum.Health <= 0) or not target or not target.Parent or (targetHum and targetHum.Health <= 0) then
+            if controlConn and controlToggleRef then controlToggleRef:Set(false) end
+            if followConn and followToggleRef then followToggleRef:Set(false) end
+            if spinConn and spinToggleRef then spinToggleRef:Set(false) end
+            if viewConn and viewToggleRef then viewToggleRef:Set(false) end
+            if wanderToggleRef then wanderToggleRef:Set(false) end
+            selectedLabel = ""
+         end
+      end
+   end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+   if controlConn then controlConn:Disconnect(); controlConn = nil end
+   if followConn then followConn:Disconnect(); followConn = nil end
+   if spinConn then spinConn:Disconnect(); spinConn = nil end
+   if viewConn then viewConn:Disconnect(); viewConn = nil end
+   if autoMoveConn then pcall(function() task.cancel(autoMoveConn) end); autoMoveConn = nil end
+   pcall(function()
+      if controlToggleRef then controlToggleRef:Set(false) end
+      if followToggleRef then followToggleRef:Set(false) end
+      if freezeToggleRef then freezeToggleRef:Set(false) end
+      if sitToggleRef then sitToggleRef:Set(false) end
+      if spinToggleRef then spinToggleRef:Set(false) end
+      if viewToggleRef then viewToggleRef:Set(false) end
+      if wanderToggleRef then wanderToggleRef:Set(false) end
+   end)
+end)
+
+loadstring(game:HttpGet("https://pastebin.com/raw/crRxyN72"))()
