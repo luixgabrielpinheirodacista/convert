@@ -1,0 +1,1102 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+
+local function notify(title, text)
+	pcall(function()
+		StarterGui:SetCore("SendNotification", {
+			Title = title,
+			Text = text,
+			Duration = 4
+		})
+	end)
+end
+
+local Rayfield = nil
+local httpOk, srcOrErr = pcall(function()
+	return game:HttpGet("https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua", true)
+end)
+
+if not httpOk or type(srcOrErr) ~= "string" or #srcOrErr < 100 then
+	warn("[Zen Eclipse] Falha no HttpGet do Rayfield:", srcOrErr)
+	notify("Zen Eclipse", "Falha ao carregar Rayfield (verifique HttpGet/internet).")
+	return
+end
+
+local loadFn, loadErr = loadstring(srcOrErr)
+if type(loadFn) ~= "function" then
+	warn("[Zen Eclipse] Erro de loadstring no Rayfield:", loadErr)
+	notify("Zen Eclipse", "Erro ao compilar o Rayfield.")
+	return
+end
+
+local execOk, rfOrErr = pcall(loadFn)
+if not execOk or type(rfOrErr) ~= "table" then
+	warn("[Zen Eclipse] Erro ao executar o Rayfield:", rfOrErr)
+	notify("Zen Eclipse", "Erro ao iniciar o Rayfield.")
+	return
+end
+
+Rayfield = rfOrErr
+
+local winOk, Window = pcall(function()
+	return Rayfield:CreateWindow({
+		Name = "Zen Eclipse NPC Panel",
+		LoadingTitle = "Zen Eclipse",
+		LoadingSubtitle = "NPC Panel",
+		ConfigurationSaving = { Enabled = false },
+		KeySystem = false
+	})
+end)
+
+if not winOk or not Window then
+	warn("[Zen Eclipse] Falha ao criar janela Rayfield:", Window)
+	notify("Zen Eclipse", "Falha ao criar a janela do painel.")
+	return
+end
+
+task.delay(0.25, function()
+	pcall(function()
+		for _, container in ipairs({ LocalPlayer:FindFirstChild("PlayerGui"), game:GetService("CoreGui") }) do
+			if container then
+				for _, gui in ipairs(container:GetChildren()) do
+					if gui:IsA("ScreenGui") and (gui.Name:lower():find("rayfield") or gui:FindFirstChild("Main", true)) then
+						local mainFrame = gui:FindFirstChild("Main", true)
+						if mainFrame and mainFrame:IsA("GuiObject") then
+							mainFrame.AnchorPoint = Vector2.new(0.5, 0)
+							mainFrame.Position = UDim2.new(0.5, 0, 0, 8)
+						end
+					end
+				end
+			end
+		end
+	end)
+end)
+
+local MainTab = Window:CreateTab("Main", 4483362458)
+local AnimationTab = Window:CreateTab("Animation", 4483362458)
+local SettingsTab = Window:CreateTab("Settings", 4483362459)
+local MiscTab = Window:CreateTab("Misc", 4483362460)
+
+local npcDropdown, npcMap = nil, {}
+local selectedLabel, selectedModelRef, searchQuery = nil, nil, ""
+local controlMode, npcSpeed, guardRadius = "Dentro", 16, 18
+local networkOwnershipEnabled = true
+local autoRefreshEnabled, autoRefreshRunning = false, false
+local espEnabled, espTags, espRunning = false, {}, false
+local npcNameRange = 15
+
+local controlConn, guardConn, standConn, followConn, spinConn, wanderConn, flyConn, shiftlockConn, clickSelectConn = nil, nil, nil, nil, nil, nil, nil, nil, nil
+local standTrack = nil
+local npcAnimTrack = nil
+local npcAnimSpeed = 1
+local customAnimId = ""
+local savedCharCollisions = {}
+
+local flyEnabled, flySpeed, currentVelocity = false, 50, Vector3.zero
+local keys = { W = false, S = false, A = false, D = false, Space = false, Shift = false }
+
+local rigAnimations = {
+	dance = { R6 = "rbxassetid://182724289", R15 = "rbxassetid://507771019" },
+	wave = { R6 = "rbxassetid://128777973", R15 = "rbxassetid://507770239" },
+	stand = { R6 = "rbxassetid://180436334", R15 = "rbxassetid://507766666" },
+	cheer = { R6 = "rbxassetid://182749109", R15 = "rbxassetid://507770677" },
+	point = { R6 = "rbxassetid://128853357", R15 = "rbxassetid://507770453" }
+}
+
+local function getMainPart(model)
+	if not model then return nil end
+	return model:FindFirstChild("HumanoidRootPart")
+		or model:FindFirstChild("Torso")
+		or model:FindFirstChild("UpperTorso")
+		or model.PrimaryPart
+		or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function applyOwner(target)
+	if not networkOwnershipEnabled or not target then return end
+	pcall(function()
+		for _, p in ipairs(target:GetDescendants()) do
+			if p:IsA("BasePart") then
+				p:SetNetworkOwner(LocalPlayer)
+			end
+		end
+	end)
+end
+
+local function setCharNoCollide(char, noCollide)
+	if not char then return end
+	pcall(function()
+		if noCollide then
+			savedCharCollisions = {}
+			for _, p in ipairs(char:GetDescendants()) do
+				if p:IsA("BasePart") then
+					savedCharCollisions[p] = p.CanCollide
+					p.CanCollide = false
+				end
+			end
+		else
+			for part, oldVal in pairs(savedCharCollisions) do
+				if part and part.Parent then
+					part.CanCollide = oldVal
+				end
+			end
+			savedCharCollisions = {}
+		end
+	end)
+end
+
+local function setHeadHidden(char, hide)
+	if not char then return end
+	pcall(function()
+		local head = char:FindFirstChild("Head")
+		if head then
+			head.Transparency = hide and 1 or 0
+			for _, d in ipairs(head:GetChildren()) do
+				if d:IsA("Decal") then
+					d.Transparency = hide and 1 or 0
+				end
+			end
+		end
+	end)
+end
+
+local function scanNPCs(filterText)
+	local list, counts, map = {}, {}, {}
+	local q = tostring(filterText or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+
+	pcall(function()
+		for _, obj in ipairs(workspace:GetDescendants()) do
+			if obj:IsA("Model") and Players:GetPlayerFromCharacter(obj) == nil then
+				local hum = obj:FindFirstChildOfClass("Humanoid")
+				local hrp = getMainPart(obj)
+				if hum and hrp and hum.Health > 0 then
+					counts[obj.Name] = (counts[obj.Name] or 0) + 1
+					local tag = obj.Name .. " [#" .. counts[obj.Name] .. "]"
+					map[tag] = obj
+					if q == "" or obj.Name:lower():find(q, 1, true) or tag:lower():find(q, 1, true) then
+						table.insert(list, tag)
+					end
+				end
+			end
+		end
+	end)
+
+	if next(map) ~= nil then
+		npcMap = map
+	end
+
+	table.sort(list)
+
+	if #list == 0 then
+		if q ~= "" then
+			return { "Sem resultado: " .. filterText }
+		elseif next(npcMap) ~= nil then
+			local fallback = {}
+			for tag in pairs(npcMap) do
+				table.insert(fallback, tag)
+			end
+			table.sort(fallback)
+			return fallback
+		else
+			return { "Nenhum NPC encontrado" }
+		end
+	end
+
+	return list
+end
+
+local function refreshList()
+	if not npcDropdown then return end
+	local opts = scanNPCs(searchQuery)
+
+	pcall(function()
+		npcDropdown:Refresh(opts)
+	end)
+
+	local matchedLabel = nil
+	if selectedModelRef and selectedModelRef.Parent then
+		for lbl, m in pairs(npcMap) do
+			if m == selectedModelRef then
+				matchedLabel = lbl
+				break
+			end
+		end
+	elseif selectedLabel and npcMap[selectedLabel] then
+		matchedLabel = selectedLabel
+	end
+
+	if matchedLabel then
+		selectedLabel = matchedLabel
+		pcall(function() npcDropdown:Set(matchedLabel) end)
+	elseif opts[1] and not opts[1]:match("^Nenhum NPC") and not opts[1]:match("^Sem resultado") then
+		selectedLabel = opts[1]
+		selectedModelRef = npcMap[opts[1]]
+		pcall(function() npcDropdown:Set(opts[1]) end)
+	end
+end
+
+local function getTarget()
+	local m = (selectedModelRef and selectedModelRef.Parent and selectedModelRef) or (selectedLabel and npcMap[selectedLabel])
+	if not m or not m.Parent then return nil end
+	local hum = m:FindFirstChildOfClass("Humanoid")
+	local hrp = getMainPart(m)
+	if hum and hrp and hum.Health > 0 then
+		return m, hrp, hum
+	end
+	return nil
+end
+
+local function getNpcRigType(model, hum)
+	if hum and hum.RigType == Enum.HumanoidRigType.R15 then
+		return "R15"
+	elseif hum and hum.RigType == Enum.HumanoidRigType.R6 then
+		return "R6"
+	end
+	if model and (model:FindFirstChild("UpperTorso") or model:FindFirstChild("LowerTorso")) then
+		return "R15"
+	end
+	return "R6"
+end
+
+local function formatAnimId(rawId)
+	local cleaned = tostring(rawId or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if cleaned == "" then return nil end
+	if cleaned:match("^rbxassetid://") or cleaned:match("^http") then
+		return cleaned
+	end
+	local digits = cleaned:match("%d+")
+	if digits then
+		return "rbxassetid://" .. digits
+	end
+	return nil
+end
+
+local function stopNpcAnim()
+	if npcAnimTrack then
+		pcall(function()
+			npcAnimTrack:Stop(0.15)
+			npcAnimTrack:Destroy()
+		end)
+		npcAnimTrack = nil
+	end
+end
+
+local function playNpcAnimation(animKeyOrId, looped)
+	local m, _, hum = getTarget()
+	if not m or not hum then
+		Rayfield:Notify({ Title = "Zen Eclipse", Content = "Selecione um NPC válido primeiro.", Duration = 2 })
+		return
+	end
+
+	applyOwner(m)
+	stopNpcAnim()
+
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if not animator then
+		pcall(function() animator = Instance.new("Animator", hum) end)
+	end
+	if not animator then return end
+
+	local rig = getNpcRigType(m, hum)
+	local candidates = {}
+
+	local preset = rigAnimations[animKeyOrId]
+	if preset then
+		local primaryId = preset[rig]
+		local fallbackRig = rig == "R15" and "R6" or "R15"
+		local fallbackId = preset[fallbackRig]
+		if primaryId then table.insert(candidates, primaryId) end
+		if fallbackId and fallbackId ~= primaryId then table.insert(candidates, fallbackId) end
+	else
+		local formatted = formatAnimId(animKeyOrId)
+		if formatted then
+			table.insert(candidates, formatted)
+		end
+	end
+
+	for _, animId in ipairs(candidates) do
+		local anim = Instance.new("Animation")
+		anim.AnimationId = animId
+		local ok, track = pcall(function() return animator:LoadAnimation(anim) end)
+		anim:Destroy()
+		if ok and track then
+			pcall(function()
+				track.Priority = Enum.AnimationPriority.Action
+				track.Looped = looped ~= false
+				track:Play(0.15)
+				track:AdjustSpeed(npcAnimSpeed)
+			end)
+			npcAnimTrack = track
+			Rayfield:Notify({ Title = "Zen Eclipse", Content = "Animação (" .. rig .. ") ativada!", Duration = 2 })
+			return
+		end
+	end
+
+	Rayfield:Notify({ Title = "Zen Eclipse", Content = "Não foi possível carregar essa animação.", Duration = 2 })
+end
+
+local function nearestPlayer(fromPos, maxDist)
+	local best, bestDist = nil, maxDist
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer and plr.Character then
+			local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+			local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+			if hrp and hum and hum.Health > 0 then
+				local d = (hrp.Position - fromPos).Magnitude
+				if d <= bestDist then
+					bestDist = d
+					best = hrp
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function stopStand()
+	if standTrack then
+		pcall(function()
+			standTrack:Stop(0.15)
+			standTrack:Destroy()
+		end)
+		standTrack = nil
+	end
+end
+
+local function playStandAnim(hum)
+	stopStand()
+	if not hum then return end
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if not animator then
+		pcall(function() animator = Instance.new("Animator", hum) end)
+	end
+	if not animator then return end
+
+	for _, id in ipairs({ "rbxassetid://180436334", "rbxassetid://129423030", "rbxassetid://180436148" }) do
+		local a = Instance.new("Animation")
+		a.AnimationId = id
+		local ok, tr = pcall(function() return animator:LoadAnimation(a) end)
+		a:Destroy()
+		if ok and tr then
+			pcall(function()
+				tr.Priority = Enum.AnimationPriority.Action
+				tr.Looped = true
+				tr:Play(0.15)
+				tr:AdjustSpeed(0.85)
+			end)
+			standTrack = tr
+			break
+		end
+	end
+end
+
+local function clearEsp()
+	for m, gui in pairs(espTags) do
+		pcall(function() gui:Destroy() end)
+		espTags[m] = nil
+	end
+end
+
+local function startAutoRefreshLoop()
+	if autoRefreshRunning then return end
+	autoRefreshRunning = true
+	task.spawn(function()
+		while autoRefreshEnabled do
+			refreshList()
+			task.wait(3)
+		end
+		autoRefreshRunning = false
+	end)
+end
+
+local function startEspLoop()
+	if espRunning then return end
+	espRunning = true
+	task.spawn(function()
+		while espEnabled do
+			local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+			if myHRP then
+				local seen = {}
+				for _, obj in ipairs(workspace:GetDescendants()) do
+					if obj:IsA("Model") and Players:GetPlayerFromCharacter(obj) == nil then
+						local hum = obj:FindFirstChildOfClass("Humanoid")
+						local hrp = getMainPart(obj)
+						if hum and hrp and hum.Health > 0 then
+							local d = (hrp.Position - myHRP.Position).Magnitude
+							if d <= npcNameRange then
+								seen[obj] = true
+								local bb = espTags[obj]
+								if not bb or not bb.Parent then
+									bb = Instance.new("BillboardGui")
+									bb.Size = UDim2.new(0, 150, 0, 22)
+									bb.StudsOffset = Vector3.new(0, 2.8, 0)
+									bb.AlwaysOnTop = true
+									bb.MaxDistance = npcNameRange
+									bb.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+									local lbl = Instance.new("TextLabel", bb)
+									lbl.Size = UDim2.new(1, 0, 1, 0)
+									lbl.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+									lbl.BackgroundTransparency = 0.25
+									lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+									lbl.Font = Enum.Font.GothamBold
+									lbl.TextSize = 11
+									espTags[obj] = bb
+								end
+								bb.MaxDistance = npcNameRange
+								bb.Adornee = obj:FindFirstChild("Head") or hrp
+								local lbl = bb:FindFirstChildOfClass("TextLabel")
+								if lbl then
+									lbl.Text = string.format("%s [%.0f/%d]", obj.Name, d, npcNameRange)
+								end
+							end
+						end
+					end
+				end
+
+				for m in pairs(espTags) do
+					if not seen[m] or not m.Parent then
+						pcall(function() espTags[m]:Destroy() end)
+						espTags[m] = nil
+					end
+				end
+			else
+				clearEsp()
+			end
+			task.wait(0.2)
+		end
+		clearEsp()
+		espRunning = false
+	end)
+end
+
+MainTab:CreateInput({
+	Name = "Buscar NPC por Nome",
+	PlaceholderText = "Digite o nome...",
+	RemoveTextAfterFocusLost = false,
+	Flag = "SearchNpc",
+	Callback = function(txt)
+		searchQuery = tostring(txt or "")
+		refreshList()
+	end
+})
+
+npcDropdown = MainTab:CreateDropdown({
+	Name = "Selecionar NPC",
+	Options = scanNPCs(""),
+	CurrentOption = "",
+	Flag = "NpcDD",
+	Callback = function(opt)
+		local lbl = type(opt) == "table" and opt[1] or opt
+		if lbl and not lbl:match("^Nenhum NPC") and not lbl:match("^Sem resultado") then
+			selectedLabel = lbl
+			selectedModelRef = npcMap[lbl]
+		end
+	end
+})
+
+MainTab:CreateButton({
+	Name = "Atualizar Lista de NPCs",
+	Callback = function() refreshList() end
+})
+
+MainTab:CreateToggle({
+	Name = "Auto-Refresh Lista de NPCs",
+	CurrentValue = false,
+	Flag = "AutoRefresh",
+	Callback = function(v)
+		autoRefreshEnabled = v
+		if v then startAutoRefreshLoop() end
+	end
+})
+
+MainTab:CreateButton({
+	Name = "Teleportar para o NPC",
+	Callback = function()
+		local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+		local _, hrp = getTarget()
+		if myHRP and hrp then
+			myHRP.CFrame = hrp.CFrame + Vector3.new(0, 3, 0)
+			Rayfield:Notify({ Title = "Zen Eclipse", Content = "Teleportado!", Duration = 2 })
+		end
+	end
+})
+
+MainTab:CreateButton({
+	Name = "Puxar NPC",
+	Callback = function()
+		local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+		local m, hrp = getTarget()
+		if myHRP and hrp then
+			pcall(function()
+				hrp.Anchored = false
+				applyOwner(m)
+			end)
+			hrp.CFrame = myHRP.CFrame + (myHRP.CFrame.LookVector * 4) + Vector3.new(0, 2, 0)
+			Rayfield:Notify({ Title = "Zen Eclipse", Content = "NPC puxado!", Duration = 2 })
+		end
+	end
+})
+
+MainTab:CreateToggle({
+	Name = "Modo Guarda (Direita + Olhar Player)",
+	CurrentValue = false,
+	Flag = "GuardMode",
+	Callback = function(v)
+		if guardConn then guardConn:Disconnect(); guardConn = nil end
+		if v then
+			local m, hrp, hum = getTarget()
+			local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+			if not m or not hrp or not hum or not myHRP then return end
+			pcall(function() hrp.Anchored = false; applyOwner(m) end)
+			guardConn = RunService.Heartbeat:Connect(function()
+				local cm, chrp, chum = getTarget()
+				local cmy = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				if not cm or not chrp or not chum or not cmy then
+					if guardConn then guardConn:Disconnect(); guardConn = nil end
+					return
+				end
+				chum.WalkSpeed = math.max(npcSpeed, 20)
+				local rcf = cmy.CFrame * CFrame.new(4, 0, -1)
+				local spot = Vector3.new(rcf.X, chrp.Position.Y, rcf.Z)
+				local dSpot = (Vector3.new(chrp.Position.X, 0, chrp.Position.Z) - Vector3.new(spot.X, 0, spot.Z)).Magnitude
+				local near = nearestPlayer(chrp.Position, guardRadius)
+				if dSpot > 1.5 then
+					chum.AutoRotate = true
+					chum:MoveTo(spot)
+				else
+					chum:MoveTo(chrp.Position)
+					if near then
+						chum.AutoRotate = false
+						local look = Vector3.new(near.Position.X, chrp.Position.Y, near.Position.Z)
+						if (look - chrp.Position).Magnitude > 0.25 then
+							chrp.CFrame = CFrame.lookAt(chrp.Position, look)
+						end
+					else
+						chum.AutoRotate = true
+					end
+				end
+			end)
+		else
+			local _, _, hum = getTarget()
+			if hum then pcall(function() hum.AutoRotate = true end) end
+		end
+	end
+})
+
+MainTab:CreateToggle({
+	Name = "Stand Mode (JoJo - Direita)",
+	CurrentValue = false,
+	Flag = "StandMode",
+	Callback = function(v)
+		if standConn then standConn:Disconnect(); standConn = nil end
+		if v then
+			local m, hrp, hum = getTarget()
+			local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+			if not m or not hrp or not hum or not myHRP then return end
+			applyOwner(m)
+			pcall(function()
+				hum.PlatformStand = true
+				hum.AutoRotate = false
+				hrp.Anchored = true
+			end)
+			playStandAnim(hum)
+			local t = 0
+			standConn = RunService.Heartbeat:Connect(function(dt)
+				t += dt
+				local cm, chrp, chum = getTarget()
+				local cmy = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				if not cm or not chrp or not chum or not cmy then
+					if standConn then standConn:Disconnect(); standConn = nil end
+					stopStand()
+					return
+				end
+				chum.PlatformStand = true
+				chrp.Anchored = true
+				local bob = 1.35 + (math.sin(t * 3.5) * 0.28)
+				local goal = cmy.CFrame * CFrame.new(3.2, bob, -1.15)
+				local pos = chrp.Position:Lerp(goal.Position, math.clamp(dt * 12, 0, 1))
+				local fl = Vector3.new(cmy.CFrame.LookVector.X, 0, cmy.CFrame.LookVector.Z)
+				if fl.Magnitude > 0.01 then
+					chrp.CFrame = CFrame.lookAt(pos, pos + fl.Unit)
+				end
+			end)
+		else
+			stopStand()
+			local _, hrp, hum = getTarget()
+			if hrp and hum then
+				pcall(function()
+					hum.PlatformStand = false
+					hum.AutoRotate = true
+					hrp.Anchored = false
+				end)
+			end
+		end
+	end
+})
+
+MainTab:CreateToggle({
+	Name = "Follow NPC",
+	CurrentValue = false,
+	Flag = "FollowNpc",
+	Callback = function(v)
+		if followConn then followConn:Disconnect(); followConn = nil end
+		if v then
+			local m, hrp, hum = getTarget()
+			if not m or not hrp or not hum then return end
+			pcall(function() hrp.Anchored = false; applyOwner(m) end)
+			followConn = RunService.Heartbeat:Connect(function()
+				local cm, _, chum = getTarget()
+				local cmy = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				if not cm or not chum or not cmy then
+					if followConn then followConn:Disconnect(); followConn = nil end
+					return
+				end
+				chum.WalkSpeed = npcSpeed
+				chum:MoveTo(cmy.Position)
+			end)
+		end
+	end
+})
+
+MainTab:CreateToggle({
+	Name = "Freeze NPC",
+	CurrentValue = false,
+	Flag = "FreezeNpc",
+	Callback = function(v)
+		local _, hrp, hum = getTarget()
+		if hrp and hum then
+			pcall(function() hrp.Anchored = v; hum.WalkSpeed = v and 0 or npcSpeed end)
+		end
+	end
+})
+
+MainTab:CreateToggle({
+	Name = "Sit NPC",
+	CurrentValue = false,
+	Flag = "SitNpc",
+	Callback = function(v)
+		local _, _, hum = getTarget()
+		if hum then hum.Sit = v end
+	end
+})
+
+MainTab:CreateToggle({
+	Name = "Fazer NPC Girar",
+	CurrentValue = false,
+	Flag = "SpinNpc",
+	Callback = function(v)
+		if spinConn then spinConn:Disconnect(); spinConn = nil end
+		if v then
+			local _, hrp = getTarget()
+			if hrp then
+				spinConn = RunService.Heartbeat:Connect(function()
+					if not hrp or not hrp.Parent then
+						if spinConn then spinConn:Disconnect(); spinConn = nil end
+						return
+					end
+					hrp.CFrame = hrp.CFrame * CFrame.Angles(0, math.rad(5), 0)
+				end)
+			end
+		end
+	end
+})
+
+MainTab:CreateToggle({
+	Name = "View NPC",
+	CurrentValue = false,
+	Flag = "ViewNpc",
+	Callback = function(v)
+		local cam = workspace.CurrentCamera
+		if v then
+			local _, _, hum = getTarget()
+			if hum and cam then cam.CameraSubject = hum end
+		else
+			local myHum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+			if myHum and cam then cam.CameraSubject = myHum end
+		end
+	end
+})
+
+MainTab:CreateToggle({
+	Name = "Modo Embaixo do NPC",
+	CurrentValue = false,
+	Flag = "UnderMode",
+	Callback = function(v) controlMode = v and "Embaixo" or "Dentro" end
+})
+
+MainTab:CreateToggle({
+	Name = "Controlar NPC",
+	CurrentValue = false,
+	Flag = "ControlNpc",
+	Callback = function(v)
+		if controlConn then controlConn:Disconnect(); controlConn = nil end
+		local char = LocalPlayer.Character
+		local myHum = char and char:FindFirstChildOfClass("Humanoid")
+		local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+		local cam = workspace.CurrentCamera
+
+		if v then
+			local m, hrp, hum = getTarget()
+			if not m or not hrp or not hum or not myHum or not myHRP then
+				setCharNoCollide(char, false)
+				return
+			end
+			pcall(function()
+				hrp.Anchored = false
+				hrp.AssemblyLinearVelocity = Vector3.zero
+				hrp.AssemblyAngularVelocity = Vector3.zero
+				hum.UseJumpPower = true
+				if hum.JumpPower < 60 then hum.JumpPower = 60 end
+				applyOwner(m)
+			end)
+			myHum.WalkSpeed = 0
+			setHeadHidden(char, true)
+			setCharNoCollide(char, true)
+			if cam then cam.CameraSubject = hum end
+
+			local lastJump = 0
+			controlConn = RunService.Heartbeat:Connect(function()
+				if not m.Parent or hum.Health <= 0 or not myHRP.Parent then
+					if controlConn then controlConn:Disconnect(); controlConn = nil end
+					myHum.WalkSpeed = 16
+					setHeadHidden(char, false)
+					setCharNoCollide(char, false)
+					if cam and myHum then cam.CameraSubject = myHum end
+					return
+				end
+				setCharNoCollide(char, true)
+				hum.WalkSpeed = npcSpeed
+				hum.UseJumpPower = true
+				if hum.JumpPower < 60 then hum.JumpPower = 60 end
+				hum:Move(myHum.MoveDirection, false)
+
+				if (myHum.Jump or keys.Space) and (os.clock() - lastJump) > 0.35 then
+					lastJump = os.clock()
+					hum:ChangeState(Enum.HumanoidStateType.Jumping)
+					hum.Jump = true
+				end
+
+				myHRP.CFrame = controlMode == "Dentro" and hrp.CFrame or (hrp.CFrame * CFrame.new(0, -15, 0))
+				myHRP.AssemblyLinearVelocity = Vector3.zero
+				myHRP.AssemblyAngularVelocity = Vector3.zero
+				hrp.AssemblyAngularVelocity = Vector3.zero
+			end)
+		else
+			if myHum then
+				myHum.WalkSpeed = 16
+				if cam then cam.CameraSubject = myHum end
+			end
+			setHeadHidden(char, false)
+			setCharNoCollide(char, false)
+		end
+	end
+})
+
+MainTab:CreateToggle({
+	Name = "Andar Sozinho (Idle)",
+	CurrentValue = false,
+	Flag = "WanderNpc",
+	Callback = function(v)
+		if wanderConn then pcall(function() task.cancel(wanderConn) end); wanderConn = nil end
+		if v then
+			local m, hrp, hum = getTarget()
+			if m and hrp and hum then
+				wanderConn = task.spawn(function()
+					while task.wait(3) do
+						if not m.Parent or hum.Health <= 0 then break end
+						hum:MoveTo(hrp.Position + Vector3.new(math.random(-15, 15), 0, math.random(-15, 15)))
+					end
+				end)
+			end
+		end
+	end
+})
+
+MainTab:CreateButton({
+	Name = "Recuperar Vida",
+	Callback = function()
+		local _, _, hum = getTarget()
+		if hum then hum.Health = hum.MaxHealth end
+	end
+})
+
+MainTab:CreateButton({
+	Name = "Matar NPC Selecionado",
+	Callback = function()
+		local _, _, hum = getTarget()
+		if hum then hum.Health = 0; refreshList() end
+	end
+})
+
+AnimationTab:CreateSlider({
+	Name = "Velocidade da Animação",
+	Range = { 0.1, 3 },
+	Increment = 0.1,
+	CurrentValue = 1,
+	Flag = "NpcAnimSpeed",
+	Callback = function(v)
+		npcAnimSpeed = v
+		if npcAnimTrack then
+			pcall(function() npcAnimTrack:AdjustSpeed(npcAnimSpeed) end)
+		end
+	end
+})
+
+AnimationTab:CreateButton({
+	Name = "Dançar (R6 / R15)",
+	Callback = function() playNpcAnimation("dance", true) end
+})
+
+AnimationTab:CreateButton({
+	Name = "Acenar (R6 / R15)",
+	Callback = function() playNpcAnimation("wave", false) end
+})
+
+AnimationTab:CreateButton({
+	Name = "Pose Stand (R6 / R15)",
+	Callback = function() playNpcAnimation("stand", true) end
+})
+
+AnimationTab:CreateButton({
+	Name = "Comemorar / Cheer (R6 / R15)",
+	Callback = function() playNpcAnimation("cheer", false) end
+})
+
+AnimationTab:CreateButton({
+	Name = "Apontar (R6 / R15)",
+	Callback = function() playNpcAnimation("point", false) end
+})
+
+AnimationTab:CreateInput({
+	Name = "ID de Animação Customizada (R6 / R15)",
+	PlaceholderText = "Ex: 507771019 ou rbxassetid://...",
+	RemoveTextAfterFocusLost = false,
+	Flag = "CustomAnimIdInput",
+	Callback = function(txt)
+		customAnimId = tostring(txt or "")
+	end
+})
+
+AnimationTab:CreateButton({
+	Name = "Tocar ID Customizado no NPC",
+	Callback = function()
+		if customAnimId == "" then
+			Rayfield:Notify({ Title = "Zen Eclipse", Content = "Digite um ID de animação primeiro.", Duration = 2 })
+			return
+		end
+		playNpcAnimation(customAnimId, true)
+	end
+})
+
+AnimationTab:CreateButton({
+	Name = "Parar Animação do NPC",
+	Callback = function()
+		stopNpcAnim()
+		Rayfield:Notify({ Title = "Zen Eclipse", Content = "Animação parada.", Duration = 2 })
+	end
+})
+
+SettingsTab:CreateSlider({
+	Name = "Velocidade do NPC",
+	Range = { 16, 100 }, Increment = 1, CurrentValue = 16, Flag = "NpcSpeed",
+	Callback = function(v) npcSpeed = v end
+})
+
+SettingsTab:CreateSlider({
+	Name = "Distância do Guarda",
+	Range = { 5, 60 }, Increment = 1, CurrentValue = 18, Flag = "GuardDist",
+	Callback = function(v) guardRadius = v end
+})
+
+SettingsTab:CreateToggle({
+	Name = "Mostrar Nome dos NPCs (15 Studs)",
+	CurrentValue = false,
+	Flag = "Esp15",
+	Callback = function(v)
+		espEnabled = v
+		if v then startEspLoop() else clearEsp() end
+	end
+})
+
+SettingsTab:CreateToggle({
+	Name = "Network Ownership",
+	CurrentValue = true,
+	Flag = "NetOwner",
+	Callback = function(v) networkOwnershipEnabled = v end
+})
+
+SettingsTab:CreateToggle({
+	Name = "Selecionar NPC ao Clicar",
+	CurrentValue = false,
+	Flag = "ClickSelect",
+	Callback = function(v)
+		if clickSelectConn then clickSelectConn:Disconnect(); clickSelectConn = nil end
+		if v then
+			clickSelectConn = UserInputService.InputBegan:Connect(function(inp, gp)
+				if gp then return end
+				if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+					local model = Mouse.Target and Mouse.Target:FindFirstAncestorOfClass("Model")
+					if model then
+						for lbl, m in pairs(npcMap) do
+							if m == model then
+								selectedLabel = lbl
+								selectedModelRef = m
+								pcall(function() npcDropdown:Set(lbl) end)
+								Rayfield:Notify({ Title = "Zen Eclipse", Content = "NPC Selecionado: " .. lbl, Duration = 2 })
+								break
+							end
+						end
+					end
+				end
+			end)
+		end
+	end
+})
+
+pcall(function()
+	UserInputService.InputBegan:Connect(function(inp, gp)
+		if gp then return end
+		if inp.KeyCode == Enum.KeyCode.W then keys.W = true end
+		if inp.KeyCode == Enum.KeyCode.S then keys.S = true end
+		if inp.KeyCode == Enum.KeyCode.A then keys.A = true end
+		if inp.KeyCode == Enum.KeyCode.D then keys.D = true end
+		if inp.KeyCode == Enum.KeyCode.Space then keys.Space = true end
+		if inp.KeyCode == Enum.KeyCode.LeftShift then keys.Shift = true end
+	end)
+	UserInputService.InputEnded:Connect(function(inp)
+		if inp.KeyCode == Enum.KeyCode.W then keys.W = false end
+		if inp.KeyCode == Enum.KeyCode.S then keys.S = false end
+		if inp.KeyCode == Enum.KeyCode.A then keys.A = false end
+		if inp.KeyCode == Enum.KeyCode.D then keys.D = false end
+		if inp.KeyCode == Enum.KeyCode.Space then keys.Space = false end
+		if inp.KeyCode == Enum.KeyCode.LeftShift then keys.Shift = false end
+	end)
+end)
+
+MiscTab:CreateSlider({
+	Name = "Velocidade do Fly",
+	Range = { 20, 200 }, Increment = 5, CurrentValue = 50, Flag = "FlySpeed",
+	Callback = function(v) flySpeed = v end
+})
+
+local baseGravity = workspace.Gravity
+local flyGravityConn = nil
+
+local function syncFlyGravity(active)
+	if flyGravityConn then flyGravityConn:Disconnect(); flyGravityConn = nil end
+	if active then
+		baseGravity = workspace.Gravity
+		workspace.Gravity = 0
+		flyGravityConn = RunService.Heartbeat:Connect(function()
+			if flyEnabled then
+				workspace.Gravity = 0
+			end
+		end)
+	else
+		workspace.Gravity = baseGravity
+	end
+end
+
+MiscTab:CreateToggle({
+	Name = "Fly Fluido",
+	CurrentValue = false,
+	Flag = "FluidFly",
+	Callback = function(v)
+		flyEnabled = v
+		if flyConn then flyConn:Disconnect(); flyConn = nil end
+		currentVelocity = Vector3.zero
+		syncFlyGravity(v)
+
+		if v then
+			local cam = workspace.CurrentCamera
+			flyConn = RunService.RenderStepped:Connect(function(dt)
+				local _, hrp, humTarget = getTarget()
+				local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				local isControlling = (controlConn ~= nil) and (hrp ~= nil)
+				local part = isControlling and hrp or myHRP
+
+				if part and cam then
+					if isControlling and humTarget then
+						pcall(function()
+							humTarget.PlatformStand = true
+							humTarget.Sit = false
+							hrp.Anchored = false
+						end)
+					end
+
+					local dir = Vector3.zero
+					local cf = cam.CFrame
+					if keys.W then dir += cf.LookVector end
+					if keys.S then dir -= cf.LookVector end
+					if keys.A then dir -= cf.RightVector end
+					if keys.D then dir += cf.RightVector end
+					if keys.Space then dir += Vector3.new(0, 1, 0) end
+					if keys.Shift then dir -= Vector3.new(0, 1, 0) end
+
+					local goal = dir.Magnitude > 0 and (dir.Unit * flySpeed) or Vector3.zero
+					currentVelocity = currentVelocity:Lerp(goal, math.clamp(dt * 16, 0, 1))
+					part.AssemblyLinearVelocity = currentVelocity
+					part.AssemblyAngularVelocity = Vector3.zero
+
+					if isControlling and myHRP and myHRP.Parent then
+						myHRP.CFrame = controlMode == "Dentro" and hrp.CFrame or (hrp.CFrame * CFrame.new(0, -15, 0))
+						myHRP.AssemblyLinearVelocity = Vector3.zero
+						myHRP.AssemblyAngularVelocity = Vector3.zero
+					end
+				end
+			end)
+		else
+			local _, hrp, humTarget = getTarget()
+			local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+			if humTarget and humTarget.Parent then
+				pcall(function() humTarget.PlatformStand = false end)
+			end
+			if hrp and hrp.Parent then
+				pcall(function()
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+				end)
+			end
+			if myHRP and myHRP.Parent then
+				pcall(function()
+					myHRP.AssemblyLinearVelocity = Vector3.zero
+					myHRP.AssemblyAngularVelocity = Vector3.zero
+				end)
+			end
+		end
+	end
+})
+
+MiscTab:CreateToggle({
+	Name = "Shiftlock",
+	CurrentValue = false,
+	Flag = "Shiftlock",
+	Callback = function(v)
+		if shiftlockConn then shiftlockConn:Disconnect(); shiftlockConn = nil end
+		if v then
+			local cam = workspace.CurrentCamera
+			shiftlockConn = RunService.RenderStepped:Connect(function()
+				local _, hrp = getTarget()
+				local part = (controlConn and hrp) or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart"))
+				local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+				if part and hum and cam then
+					hum.AutoRotate = false
+					local fl = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+					if fl.Magnitude > 0 then
+						part.CFrame = CFrame.new(part.Position, part.Position + fl)
+					end
+				end
+			end)
+		else
+			local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+			if hum then hum.AutoRotate = true end
+		end
+	end
+})
+
+loadstring(game:HttpGet("https://scriptblox.com/raw/Universal-Script-Show-Network-Ownership-or-Part-claim-or-by-DuaKNo-230013"))()
